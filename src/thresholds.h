@@ -49,13 +49,13 @@
 
 /*
  * Tiny region size definitions; these are split into quanta of 16 bytes,
- * 64520 blocks is the magical value of how many quanta we can fit in a 1mb
+ * 64504 blocks is the magical value of how many quanta we can fit in a 1mb
  * region including the region trailer and metadata.
  */
 #define SHIFT_TINY_QUANTUM 4ull
 #define SHIFT_TINY_CEIL_BLOCKS 16 // ceil(log2(NUM_TINY_BLOCKS))
 #define TINY_QUANTUM (1 << SHIFT_TINY_QUANTUM)
-#define NUM_TINY_BLOCKS 64520
+#define NUM_TINY_BLOCKS 64504
 #define NUM_TINY_CEIL_BLOCKS (1 << SHIFT_TINY_CEIL_BLOCKS)
 #define NUM_TINY_SLOTS (TINY_LIMIT_THRESHOLD >> SHIFT_TINY_QUANTUM)
 
@@ -86,16 +86,16 @@
  * even below that to avoid the convention msize=0 => msize = (1<<15)
  */
 #define SHIFT_MEDIUM_QUANTUM (SHIFT_SMALL_QUANTUM + 6) // 15
-#define SHIFT_MEDIUM_CEIL_BLOCKS 14ull // ceil(log2(NUM_MEDIUM_BLOCKS))
+#define SHIFT_MEDIUM_CEIL_BLOCKS 12ull // ceil(log2(NUM_MEDIUM_BLOCKS))
 #define MEDIUM_QUANTUM ((uint64_t)(1 << SHIFT_MEDIUM_QUANTUM)) // 32kbytes
-#define MEDIUM_BLOCKS_ALIGN (SHIFT_MEDIUM_CEIL_BLOCKS + SHIFT_MEDIUM_QUANTUM) // 29
-#define NUM_MEDIUM_BLOCKS 16381
+#define MEDIUM_BLOCKS_ALIGN (SHIFT_MEDIUM_CEIL_BLOCKS + SHIFT_MEDIUM_QUANTUM) // 27
+#define NUM_MEDIUM_BLOCKS 4095
 #define NUM_MEDIUM_CEIL_BLOCKS (1ull << SHIFT_MEDIUM_CEIL_BLOCKS)
 #define NUM_MEDIUM_SLOTS (MEDIUM_LIMIT_THRESHOLD >> SHIFT_MEDIUM_QUANTUM)
 #define MEDIUM_ACTIVATION_THRESHOLD (32ull * 1024 * 1024 * 1024)
 #define MEDIUM_CONDITIONAL_MADVISE_LIMIT (2 * 1024 * 1024)
 #define MEDIUM_MADVISE_SHIFT 4
-#define MEDIUM_MADVISE_MIN (512 * 1024)
+#define MEDIUM_MADVISE_MIN ((3 * 1024 * 1024) / 2) // 1.5 megabytes
 
 /*
  * When performing a realloc() that must fallback to creating a new allocation
@@ -126,14 +126,21 @@
  * an overall top limit size, each entry is allowed a given slice of
  * that limit.
  */
+
+#define LARGE_CACHE_EXPANDED_THRESHOLD (32ull * 1024 * 1024 * 1024)
+
 #if MALLOC_TARGET_64BIT
-#define LARGE_ENTRY_CACHE_SIZE 16
-#define LARGE_CACHE_SIZE_LIMIT ((vm_size_t)0x80000000) /* 2Gb */
-#define LARGE_CACHE_SIZE_ENTRY_LIMIT (LARGE_CACHE_SIZE_LIMIT / LARGE_ENTRY_CACHE_SIZE)
+#define LARGE_ENTRY_CACHE_SIZE_HIGH 64
+#define LARGE_ENTRY_SIZE_ENTRY_LIMIT_HIGH (512 * 1024 * 1024)
+// lowmem config
+#define LARGE_ENTRY_CACHE_SIZE_LOW 16
+#define LARGE_ENTRY_SIZE_ENTRY_LIMIT_LOW (128 * 1024 * 1024)
 #else // MALLOC_TARGET_64BIT
-#define LARGE_ENTRY_CACHE_SIZE 8
-#define LARGE_CACHE_SIZE_LIMIT ((vm_size_t)0x02000000) /* 32Mb */
-#define LARGE_CACHE_SIZE_ENTRY_LIMIT (LARGE_CACHE_SIZE_LIMIT / LARGE_ENTRY_CACHE_SIZE)
+#define LARGE_ENTRY_CACHE_SIZE_HIGH 8
+#define LARGE_ENTRY_SIZE_ENTRY_LIMIT_HIGH (32 * 1024 * 1024)
+// lowmem config same as "highmem"
+#define LARGE_ENTRY_CACHE_SIZE_LOW LARGE_ENTRY_CACHE_SIZE_HIGH
+#define LARGE_ENTRY_SIZE_ENTRY_LIMIT_LOW LARGE_ENTRY_SIZE_ENTRY_LIMIT_HIGH
 #endif // MALLOC_TARGET_64BIT
 
 /*

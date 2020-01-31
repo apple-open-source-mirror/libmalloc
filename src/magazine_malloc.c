@@ -26,10 +26,12 @@
 /*
  * Multithread enhancements for "tiny" allocations introduced February 2008.
  * These are in the spirit of "Hoard". See:
- * Berger, E.D.; McKinley, K.S.; Blumofe, R.D.; Wilson, P.R. (2000).
- * "Hoard: a scalable memory allocator for multithreaded applications".
- * ACM SIGPLAN Notices 35 (11): 117-128. Berger2000.
- * <http://portal.acm.org/citation.cfm?id=356989.357000>
+ * Emery D. Berger, Kathryn S. McKinley, Robert D. Blumofe, and Paul R. Wilson. 2000.
+ * Hoard: a scalable memory allocator for multithreaded applications.
+ * In Proceedings of the ninth international conference on Architectural support for
+ * programming languages and operating systems (ASPLOS IX).
+ * ACM, New York, NY, USA, 117-128.
+ * DOI: https://doi.org/10.1145/378993.379232
  * Retrieved on 2008-02-22.
  */
 
@@ -50,6 +52,9 @@ bool magazine_medium_enabled = true;
 
 // Control the DRAM limit at which medium kicks in.
 uint64_t magazine_medium_active_threshold = MEDIUM_ACTIVATION_THRESHOLD;
+
+// Control the DRAM limit at which the expanded large cache kicks in.
+uint64_t magazine_large_expanded_cache_threshold = LARGE_CACHE_EXPANDED_THRESHOLD;
 
 // <rdar://problem/47353961> Maximum number of magzines that the medium
 // allocator will use. This addresses a 32-bit load-offset range issue found
@@ -91,7 +96,7 @@ szone_free(szone_t *szone, void *ptr)
 			malloc_zone_error(szone->debug_flags, true, "Pointer %p to metadata being freed\n", ptr);
 			return;
 		}
-		free_tiny(&szone->tiny_rack, ptr, tiny_region, 0);
+		free_tiny(&szone->tiny_rack, ptr, tiny_region, 0, false);
 		return;
 	}
 
@@ -163,7 +168,7 @@ szone_free_definite_size(szone_t *szone, void *ptr, size_t size)
 			malloc_zone_error(szone->debug_flags, true, "Pointer %p to metadata being freed\n", ptr);
 			return;
 		}
-		free_tiny(&szone->tiny_rack, ptr, TINY_REGION_FOR_PTR(ptr), size);
+		free_tiny(&szone->tiny_rack, ptr, TINY_REGION_FOR_PTR(ptr), size, false);
 		return;
 	}
 
@@ -656,7 +661,7 @@ szone_destroy(szone_t *szone)
 
 	// stack allocated copy of the death-row cache
 	int idx = szone->large_entry_cache_oldest, idx_max = szone->large_entry_cache_newest;
-	large_entry_t local_entry_cache[LARGE_ENTRY_CACHE_SIZE];
+	large_entry_t local_entry_cache[LARGE_ENTRY_CACHE_SIZE_HIGH];
 
 	memcpy((void *)local_entry_cache, (void *)szone->large_entry_cache, sizeof(local_entry_cache));
 
@@ -671,7 +676,7 @@ szone_destroy(szone_t *szone)
 	// deallocate the death-row cache outside the zone lock
 	while (idx != idx_max) {
 		mvm_deallocate_pages((void *)local_entry_cache[idx].address, local_entry_cache[idx].size, 0);
-		if (++idx == LARGE_ENTRY_CACHE_SIZE) {
+		if (++idx == szone->large_cache_depth) {
 			idx = 0;
 		}
 	}
@@ -907,7 +912,7 @@ szone_ptr_in_use_enumerator(task_t task,
 	kern_return_t err;
 
 	if (!reader) {
-		reader = _szone_default_reader;
+		reader = _malloc_default_reader;
 	}
 
 	err = reader(task, zone_address, sizeof(szone_t), (void **)&szone);
@@ -939,9 +944,9 @@ szone_ptr_in_use_enumerator(task_t task,
 	return err;
 }
 
-// Following method is deprecated:  use scalable_zone_statistics instead
-void
-scalable_zone_info(malloc_zone_t *zone, unsigned *info_to_fill, unsigned count)
+static boolean_t
+scalable_zone_info_task(task_t task, memory_reader_t reader,
+		malloc_zone_t *zone, unsigned *info_to_fill, unsigned count)
 {
 	szone_t *szone = (void *)zone;
 	unsigned info[13];
@@ -953,21 +958,30 @@ scalable_zone_info(malloc_zone_t *zone, unsigned *info_to_fill, unsigned count)
 	size_t u = 0;
 	mag_index_t mag_index;
 
+	magazine_t *mapped_magazines;
+	if (reader(task, (vm_address_t)szone->tiny_rack.magazines,
+			sizeof(magazine_t), (void **)&mapped_magazines)) {
+		return false;
+	}
 	for (mag_index = -1; mag_index < szone->tiny_rack.num_magazines; mag_index++) {
-		s += szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_start;
-		s += szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_end;
-		t += szone->tiny_rack.magazines[mag_index].mag_num_objects;
-		u += szone->tiny_rack.magazines[mag_index].mag_num_bytes_in_objects;
+		s += mapped_magazines[mag_index].mag_bytes_free_at_start;
+		s += mapped_magazines[mag_index].mag_bytes_free_at_end;
+		t += mapped_magazines[mag_index].mag_num_objects;
+		u += mapped_magazines[mag_index].mag_num_bytes_in_objects;
 	}
 
 	info[4] = (unsigned)t;
 	info[5] = (unsigned)u;
 
+	if (reader(task, (vm_address_t)szone->small_rack.magazines,
+			sizeof(magazine_t), (void **)&mapped_magazines)) {
+		return false;
+	}
 	for (t = 0, u = 0, mag_index = -1; mag_index < szone->small_rack.num_magazines; mag_index++) {
-		s += szone->small_rack.magazines[mag_index].mag_bytes_free_at_start;
-		s += szone->small_rack.magazines[mag_index].mag_bytes_free_at_end;
-		t += szone->small_rack.magazines[mag_index].mag_num_objects;
-		u += szone->small_rack.magazines[mag_index].mag_num_bytes_in_objects;
+		s += mapped_magazines[mag_index].mag_bytes_free_at_start;
+		s += mapped_magazines[mag_index].mag_bytes_free_at_end;
+		t += mapped_magazines[mag_index].mag_num_objects;
+		u += mapped_magazines[mag_index].mag_num_bytes_in_objects;
 	}
 
 	info[6] = (unsigned)t;
@@ -989,86 +1003,266 @@ scalable_zone_info(malloc_zone_t *zone, unsigned *info_to_fill, unsigned count)
 
 	info[2] = info[3] - (unsigned)s;
 	memcpy(info_to_fill, info, sizeof(unsigned) * count);
+
+	return true;
+}
+
+// Following method is deprecated:  use scalable_zone_statistics instead
+// Required for backward compatibility.
+void
+scalable_zone_info(malloc_zone_t *zone, unsigned *info_to_fill, unsigned count) {
+	scalable_zone_info_task(mach_task_self(), _malloc_default_reader, zone,
+			info_to_fill, count);
 }
 
 // FIXME: consistent picture requires locking!
 static MALLOC_NOINLINE void
-szone_print(szone_t *szone, boolean_t verbose)
+szone_print(task_t task, unsigned level, vm_address_t zone_address,
+		memory_reader_t reader, print_task_printer_t printer)
 {
 	unsigned info[13];
 	size_t index;
 	region_t region;
+	region_t mapped_region;
 
-	scalable_zone_info((void *)szone, info, 13);
-	malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX,
-			"Scalable zone %p: inUse=%u(%y) touched=%y allocated=%y flags=%d\n", szone, info[0], info[1], info[2], info[3],
-			info[12]);
-	malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "\ttiny=%u(%y) small=%u(%y) large=%u(%y) huge=%u(%y)\n", info[4],
-			info[5], info[6], info[7], info[8], info[9], info[10], info[11]);
+	szone_t *szone = (szone_t *)zone_address;
+	szone_t *mapped_szone;
+	if (reader(task, zone_address, sizeof(szone_t), (void **)&mapped_szone)) {
+		printer("Failed to read szone structure\n");
+		return;
+	}
+
+	if (!scalable_zone_info_task(task, reader, (void *)mapped_szone, info, 13)) {
+		printer("Failed to get scalable zone info\n");
+		return;
+	}
+	printer("Scalable zone %p: inUse=%u(%u) touched=%u allocated=%u flags=0x%x\n",
+			zone_address, info[0], info[1], info[2], info[3], info[12]);
+	printer("\ttiny=%u(%u) small=%u(%u) large=%u(%u)\n", info[4],
+			info[5], info[6], info[7], info[8], info[9]);
 	// tiny
-	malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%lu tiny regions:\n", szone->tiny_rack.num_regions);
-	if (szone->tiny_rack.num_regions_dealloc) {
-		malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "[%lu tiny regions have been vm_deallocate'd]\n",
-				szone->tiny_rack.num_regions_dealloc);
+	printer("%lu tiny regions:\n", mapped_szone->tiny_rack.num_regions);
+	if (mapped_szone->tiny_rack.num_regions_dealloc) {
+		printer("[%lu tiny regions have been vm_deallocate'd]\n",
+				mapped_szone->tiny_rack.num_regions_dealloc);
 	}
-	for (index = 0; index < szone->tiny_rack.region_generation->num_regions_allocated; ++index) {
-		region = szone->tiny_rack.region_generation->hashed_regions[index];
+
+	region_hash_generation_t *mapped_region_generation;
+	region_t *mapped_hashed_regions;
+	magazine_t *mapped_magazines;
+	if (reader(task, (vm_address_t)mapped_szone->tiny_rack.region_generation,
+			sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
+		printer("Failed to map tiny rack region_generation\n");
+		return;
+	}
+	if (reader(task, (vm_address_t)mapped_region_generation->hashed_regions,
+			sizeof(region_t), (void **)&mapped_hashed_regions)) {
+		printer("Failed to map tiny rack hashed_regions\n");
+		return;
+	}
+	if (reader(task, (vm_address_t)mapped_szone->tiny_rack.magazines,
+			mapped_szone->tiny_rack.num_magazines * sizeof(magazine_t),
+			(void **)&mapped_magazines)) {
+		printer("Failed to map tiny rack magazines\n");
+		return;
+	}
+
+	int recirc_regions = 0;
+	for (index = 0; index < mapped_region_generation->num_regions_allocated; ++index) {
+		region = mapped_hashed_regions[index];
 		if (HASHRING_OPEN_ENTRY != region && HASHRING_REGION_DEALLOCATED != region) {
-			mag_index_t mag_index = MAGAZINE_INDEX_FOR_TINY_REGION(region);
-			print_tiny_region(verbose, region, (region == szone->tiny_rack.magazines[mag_index].mag_last_region)
-													   ? szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_start
-													   : 0,
-					(region == szone->tiny_rack.magazines[mag_index].mag_last_region)
-							? szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_end
-							: 0);
+			if (reader(task, (vm_address_t)region, sizeof(struct tiny_region),
+					(void **)&mapped_region)) {
+				printer("Failed to map region %p\n", region);
+				return;
+			}
+			mag_index_t mag_index = MAGAZINE_INDEX_FOR_TINY_REGION(mapped_region);
+			if (mag_index == DEPOT_MAGAZINE_INDEX) {
+				recirc_regions++;
+			}
+			print_tiny_region(task, reader, printer, level, region,
+					(region == mapped_magazines[mag_index].mag_last_region)
+						? mapped_magazines[mag_index].mag_bytes_free_at_start
+						: 0,
+					(region == mapped_magazines[mag_index].mag_last_region)
+						? mapped_magazines[mag_index].mag_bytes_free_at_end
+						: 0);
 		}
 	}
-	if (verbose) {
-		print_tiny_free_list(&szone->tiny_rack);
+
+#if CONFIG_RECIRC_DEPOT
+	magazine_t *mapped_recirc_depot = &mapped_magazines[DEPOT_MAGAZINE_INDEX];
+	if (mapped_recirc_depot->mag_num_bytes_in_objects) {
+		printer("Tiny recirc depot: total bytes: %llu, in-use bytes: %llu, "
+				"allocations: %llu, regions: %d (min # retained regions: %d)\n",
+				mapped_recirc_depot->num_bytes_in_magazine,
+				mapped_recirc_depot->mag_num_bytes_in_objects,
+				mapped_recirc_depot->mag_num_objects, recirc_regions,
+				recirc_retained_regions);
+	} else {
+		printer("Tiny recirc depot is empty\n");
 	}
+#else // CONFIG_RECIRC_DEPOT
+	printer("Tiny recirc depot not configured\n");
+#endif // CONFIG_RECIRC_DEPOT
+
+	if (level > 0) {
+		print_tiny_free_list(task, reader, printer, &szone->tiny_rack);
+	}
+
 	// small
-	malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%lu small regions:\n", szone->small_rack.num_regions);
-	if (szone->small_rack.num_regions_dealloc) {
-		malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "[%lu small regions have been vm_deallocate'd]\n",
-				szone->small_rack.num_regions_dealloc);
+	printer("%lu small regions:\n", mapped_szone->small_rack.num_regions);
+	if (mapped_szone->small_rack.num_regions_dealloc) {
+		printer("[%lu small regions have been vm_deallocate'd]\n",
+				mapped_szone->small_rack.num_regions_dealloc);
 	}
-	for (index = 0; index < szone->small_rack.region_generation->num_regions_allocated; ++index) {
-		region = szone->small_rack.region_generation->hashed_regions[index];
+	if (reader(task, (vm_address_t)mapped_szone->small_rack.region_generation,
+			sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
+		printer("Failed to map small rack region_generation\n");
+		return;
+	}
+	if (reader(task, (vm_address_t)mapped_region_generation->hashed_regions,
+			sizeof(region_t), (void **)&mapped_hashed_regions)) {
+		printer("Failed to map small rack hashed_regions\n");
+		return;
+	}
+	if (reader(task, (vm_address_t)mapped_szone->small_rack.magazines,
+			mapped_szone->small_rack.num_magazines * sizeof(magazine_t),
+			(void **)&mapped_magazines)) {
+		printer("Failed to map small rack magazines\n");
+		return;
+	}
+
+	recirc_regions = 0;
+	for (index = 0; index < mapped_region_generation->num_regions_allocated; ++index) {
+		region = mapped_hashed_regions[index];
 		if (HASHRING_OPEN_ENTRY != region && HASHRING_REGION_DEALLOCATED != region) {
-			mag_index_t mag_index = MAGAZINE_INDEX_FOR_SMALL_REGION(region);
-			print_small_region(szone, verbose, region, (region == szone->small_rack.magazines[mag_index].mag_last_region)
-															   ? szone->small_rack.magazines[mag_index].mag_bytes_free_at_start
-															   : 0,
-					(region == szone->small_rack.magazines[mag_index].mag_last_region)
-							? szone->small_rack.magazines[mag_index].mag_bytes_free_at_end
-							: 0);
+			if (reader(task, (vm_address_t)region, sizeof(struct small_region),
+					(void **)&mapped_region)) {
+				printer("Failed to map region %p\n", region);
+				return;
+			}
+			mag_index_t mag_index = MAGAZINE_INDEX_FOR_SMALL_REGION(mapped_region);
+			if (mag_index == DEPOT_MAGAZINE_INDEX) {
+				recirc_regions++;
+			}
+			print_small_region(task, reader, printer, mapped_szone, level, region,
+					(region == mapped_magazines[mag_index].mag_last_region)
+						? mapped_magazines[mag_index].mag_bytes_free_at_start
+						: 0,
+					(region == mapped_magazines[mag_index].mag_last_region)
+						? mapped_magazines[mag_index].mag_bytes_free_at_end
+						: 0);
 		}
 	}
+
+#if CONFIG_RECIRC_DEPOT
+	mapped_recirc_depot = &mapped_magazines[DEPOT_MAGAZINE_INDEX];
+	if (mapped_recirc_depot->mag_num_bytes_in_objects) {
+		printer("Small recirc depot: total bytes: %llu, in-use bytes: %llu, "
+				"allocations: %llu, regions: %d (min # retained regions: %d)\n",
+				mapped_recirc_depot->num_bytes_in_magazine,
+				mapped_recirc_depot->mag_num_bytes_in_objects,
+				mapped_recirc_depot->mag_num_objects, recirc_regions,
+				recirc_retained_regions);
+	} else {
+		printer("Small recirc depot is empty\n");
+	}
+#else // CONFIG_RECIRC_DEPOT
+	printer("Small recirc depot not configured\n");
+#endif // CONFIG_RECIRC_DEPOT
+
+	if (level > 0) {
+		print_small_free_list(task, reader, printer, &szone->small_rack);
+	}
+
 #if CONFIG_MEDIUM_ALLOCATOR
 	if (szone->is_medium_engaged) {
 		// medium
-		malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%lu medium regions:\n", szone->medium_rack.num_regions);
-		if (szone->medium_rack.num_regions_dealloc) {
-			malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "[%lu medium regions have been vm_deallocate'd]\n",
-					szone->medium_rack.num_regions_dealloc);
+		printer("%lu medium regions:\n", mapped_szone->medium_rack.num_regions);
+		if (mapped_szone->medium_rack.num_regions_dealloc) {
+			printer("[%lu medium regions have been vm_deallocate'd]\n",
+					mapped_szone->medium_rack.num_regions_dealloc);
 		}
-		for (index = 0; index < szone->medium_rack.region_generation->num_regions_allocated; ++index) {
-			region = szone->medium_rack.region_generation->hashed_regions[index];
+		if (reader(task, (vm_address_t)mapped_szone->medium_rack.region_generation,
+				sizeof(region_hash_generation_t), (void **)&mapped_region_generation)) {
+			printer("Failed to map medium rack region_generation\n");
+			return;
+		}
+		if (reader(task, (vm_address_t)mapped_region_generation->hashed_regions,
+				sizeof(region_t), (void **)&mapped_hashed_regions)) {
+			printer("Failed to map medium rack hashed_regions\n");
+			return;
+		}
+		if (reader(task, (vm_address_t)mapped_szone->medium_rack.magazines,
+				mapped_szone->medium_rack.num_magazines * sizeof(magazine_t),
+				(void **)&mapped_magazines)) {
+			printer("Failed to map medium rack magazines\n");
+			return;
+		}
+
+		recirc_regions = 0;
+		for (index = 0; index < mapped_region_generation->num_regions_allocated; ++index) {
+			region = mapped_hashed_regions[index];
 			if (HASHRING_OPEN_ENTRY != region && HASHRING_REGION_DEALLOCATED != region) {
-				mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(region);
-				print_medium_region(szone, verbose, region, (region == szone->medium_rack.magazines[mag_index].mag_last_region)
-																   ? szone->medium_rack.magazines[mag_index].mag_bytes_free_at_start
-																   : 0,
-						(region == szone->medium_rack.magazines[mag_index].mag_last_region)
-								? szone->medium_rack.magazines[mag_index].mag_bytes_free_at_end
-								: 0);
+				if (reader(task, (vm_address_t)region, sizeof(struct medium_region),
+						(void **)&mapped_region)) {
+					printer("Failed to map region %p\n", region);
+					return;
+				}
+				mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(mapped_region);
+				if (mag_index == DEPOT_MAGAZINE_INDEX) {
+					recirc_regions++;
+				}
+				print_medium_region(task, reader, printer, mapped_szone, level,
+						region,
+						(region == mapped_magazines[mag_index].mag_last_region)
+							? mapped_magazines[mag_index].mag_bytes_free_at_start
+							: 0,
+						(region == mapped_magazines[mag_index].mag_last_region)
+							? mapped_magazines[mag_index].mag_bytes_free_at_end
+							: 0);
 			}
+		}
+
+#if CONFIG_RECIRC_DEPOT
+		mapped_recirc_depot = &mapped_magazines[DEPOT_MAGAZINE_INDEX];
+		if (mapped_recirc_depot->mag_num_bytes_in_objects) {
+			printer("Medium recirc depot: total bytes: %llu, in-use bytes: %llu, "
+					"allocations: %llu, regions: %d (min # retained regions: %d)\n",
+					mapped_recirc_depot->num_bytes_in_magazine,
+					mapped_recirc_depot->mag_num_bytes_in_objects,
+					mapped_recirc_depot->mag_num_objects, recirc_regions,
+					recirc_retained_regions);
+		} else {
+			printer("Medium recirc depot is empty\n");
+		}
+#else // CONFIG_RECIRC_DEPOT
+		printer("Medium recirc depot not configured\n");
+#endif // CONFIG_RECIRC_DEPOT
+
+		if (level > 0) {
+			print_medium_free_list(task, reader, printer, &szone->medium_rack);
 		}
 	}
 #endif // CONFIG_MEDIUM_ALLOCATOR
-	if (verbose) {
-		print_small_free_list(&szone->small_rack);
-	}
+
+	// Large
+	large_debug_print(task, level, zone_address, reader, printer);
+}
+
+static void
+szone_print_self(szone_t *szone, boolean_t verbose)
+{
+	szone_print(mach_task_self(), verbose ? MALLOC_VERBOSE_PRINT_LEVEL : 0,
+			(vm_address_t)szone, _malloc_default_reader, malloc_report_simple);
+}
+
+static void
+szone_print_task(task_t task, unsigned level, vm_address_t zone_address,
+		memory_reader_t reader, print_task_printer_t printer)
+{
+	szone_print(task, level, zone_address, reader, printer);
 }
 
 static void
@@ -1237,7 +1431,7 @@ szone_pressure_relief(szone_t *szone, size_t goal)
 
 		// stack allocated copy of the death-row cache
 		int idx = szone->large_entry_cache_oldest, idx_max = szone->large_entry_cache_newest;
-		large_entry_t local_entry_cache[LARGE_ENTRY_CACHE_SIZE];
+		large_entry_t local_entry_cache[LARGE_ENTRY_CACHE_SIZE_HIGH];
 
 		memcpy((void *)local_entry_cache, (void *)szone->large_entry_cache, sizeof(local_entry_cache));
 
@@ -1256,7 +1450,7 @@ szone_pressure_relief(szone_t *szone, size_t goal)
 		while (idx != idx_max) {
 			mvm_deallocate_pages((void *)local_entry_cache[idx].address, local_entry_cache[idx].size, 0);
 			total += local_entry_cache[idx].size;
-			if (++idx == LARGE_ENTRY_CACHE_SIZE) {
+			if (++idx == szone->large_cache_depth) {
 				idx = 0;
 			}
 		}
@@ -1356,28 +1550,43 @@ scalable_zone_statistics(malloc_zone_t *zone, malloc_statistics_t *stats, unsign
 	return 0;
 }
 
-static void
-szone_statistics(szone_t *szone, malloc_statistics_t *stats)
+static kern_return_t
+szone_statistics_task(task_t task, vm_address_t zone_address,
+					  memory_reader_t reader, malloc_statistics_t *stats)
 {
-	size_t large;
+	reader = !reader && task == mach_task_self() ? _malloc_default_reader : reader;
 
+	szone_t *szone;
+	kern_return_t err;
+
+	err = reader(task, zone_address, sizeof(szone_t), (void**)&szone);
+	if (err) return err;
+
+	size_t large;
 	size_t s = 0;
 	unsigned t = 0;
 	size_t u = 0;
 	mag_index_t mag_index;
 
+	magazine_t *mags;
+	err = reader(task, (vm_address_t)szone->tiny_rack.magazines, sizeof(magazine_t) * szone->tiny_rack.num_magazines, (void**)&mags);
+	if (err) return err;
+
 	for (mag_index = -1; mag_index < szone->tiny_rack.num_magazines; mag_index++) {
-		s += szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_start;
-		s += szone->tiny_rack.magazines[mag_index].mag_bytes_free_at_end;
-		t += szone->tiny_rack.magazines[mag_index].mag_num_objects;
-		u += szone->tiny_rack.magazines[mag_index].mag_num_bytes_in_objects;
+		s += mags[mag_index].mag_bytes_free_at_start;
+		s += mags[mag_index].mag_bytes_free_at_end;
+		t += mags[mag_index].mag_num_objects;
+		u += mags[mag_index].mag_num_bytes_in_objects;
 	}
 
+	err = reader(task, (vm_address_t)szone->small_rack.magazines, sizeof(magazine_t) * szone->small_rack.num_magazines, (void**)&mags);
+	if (err) return err;
+
 	for (mag_index = -1; mag_index < szone->small_rack.num_magazines; mag_index++) {
-		s += szone->small_rack.magazines[mag_index].mag_bytes_free_at_start;
-		s += szone->small_rack.magazines[mag_index].mag_bytes_free_at_end;
-		t += szone->small_rack.magazines[mag_index].mag_num_objects;
-		u += szone->small_rack.magazines[mag_index].mag_num_bytes_in_objects;
+		s += mags[mag_index].mag_bytes_free_at_start;
+		s += mags[mag_index].mag_bytes_free_at_end;
+		t += mags[mag_index].mag_num_objects;
+		u += mags[mag_index].mag_num_bytes_in_objects;
 	}
 
 #if CONFIG_MEDIUM_ALLOCATOR
@@ -1391,9 +1600,9 @@ szone_statistics(szone_t *szone, malloc_statistics_t *stats)
 	}
 #endif // CONFIG_MEDIUM_ALLOCATOR
 
-	large = szone->num_bytes_in_large_objects + 0; // DEPRECATED szone->num_bytes_in_huge_objects;
+	large = szone->num_bytes_in_large_objects;
 
-	stats->blocks_in_use = t + szone->num_large_objects_in_use + 0; // DEPRECATED szone->num_huge_entries;
+	stats->blocks_in_use = t + szone->num_large_objects_in_use;
 	stats->size_in_use = u + large;
 	stats->max_size_in_use = stats->size_allocated =
 			(szone->tiny_rack.num_regions - szone->tiny_rack.num_regions_dealloc) * TINY_REGION_SIZE +
@@ -1407,13 +1616,23 @@ szone_statistics(szone_t *szone, malloc_statistics_t *stats)
 #endif
 	// Now we account for the untouched areas
 	stats->max_size_in_use -= s;
+
+	return KERN_SUCCESS;
+}
+
+static void
+szone_statistics(szone_t *szone, malloc_statistics_t *stats)
+{
+	szone_statistics_task(mach_task_self(), (vm_address_t)szone, NULL, stats);
 }
 
 const struct malloc_introspection_t szone_introspect = {
-		(void *)szone_ptr_in_use_enumerator, (void *)szone_good_size, (void *)szone_check, (void *)szone_print, szone_log,
+		(void *)szone_ptr_in_use_enumerator, (void *)szone_good_size, (void *)szone_check, (void *)szone_print_self, szone_log,
 		(void *)szone_force_lock, (void *)szone_force_unlock, (void *)szone_statistics, (void *)szone_locked, NULL, NULL, NULL,
 		NULL, /* Zone enumeration version 7 and forward. */
-		(void *)szone_reinit_lock, // reinit_lock version 9 and foward
+		(void *)szone_reinit_lock, // reinit_lock version 9 and forward
+		(void *)szone_print_task,  // print task, version 11 and forward
+		(void *)szone_statistics_task // stats for task, version 12 and forward
 }; // marked as const to spare the DATA section
 
 szone_t *
@@ -1480,6 +1699,13 @@ create_scalable_szone(size_t initial_size, unsigned debug_flags)
 #if CONFIG_LARGE_CACHE
 	// madvise(..., MADV_REUSABLE) death-row arrivals above this threshold [~0.1%]
 	szone->large_entry_cache_reserve_limit = (size_t)(memsize >> 10);
+	if (memsize >= magazine_large_expanded_cache_threshold) {
+		szone->large_cache_depth = LARGE_ENTRY_CACHE_SIZE_HIGH;
+		szone->large_cache_entry_limit = LARGE_ENTRY_SIZE_ENTRY_LIMIT_HIGH;
+	} else {
+		szone->large_cache_depth = LARGE_ENTRY_CACHE_SIZE_LOW;
+		szone->large_cache_entry_limit = LARGE_ENTRY_SIZE_ENTRY_LIMIT_LOW;
+	}
 
 	/* <rdar://problem/6610904> Reset protection when returning a previous large allocation? */
 	int32_t libSystemVersion = NSVersionOfLinkTimeLibrary("System");
@@ -1493,7 +1719,7 @@ create_scalable_szone(size_t initial_size, unsigned debug_flags)
 	// Initialize the security token.
 	szone->cookie = (uintptr_t)malloc_entropy[0];
 
-	szone->basic_zone.version = 10;
+	szone->basic_zone.version = 12;
 	szone->basic_zone.size = (void *)szone_size;
 	szone->basic_zone.malloc = (void *)szone_malloc;
 	szone->basic_zone.calloc = (void *)szone_calloc;

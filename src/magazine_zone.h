@@ -90,8 +90,6 @@ typedef struct {
 
 typedef unsigned int grain_t; // N.B. wide enough to index all free slots
 
-typedef int mag_index_t;
-
 #define CHECK_REGIONS (1 << 31)
 #define DISABLE_ASLR (1 << 30)
 
@@ -104,7 +102,7 @@ typedef int mag_index_t;
  * szone's hashed_regions pointer.
  *
  * Each region is laid out as a heap, followed by a header block, all within
- * a 1MB (2^20) block.  This means there are 64520 16-byte blocks and the header
+ * a 1MB (2^20) block.  This means there are 64504 16-byte blocks and the header
  * is 16138 bytes, making the total 1048458 bytes, leaving 118 bytes unused.
  *
  * The header block is arranged as in struct tiny_region defined just below, and
@@ -119,7 +117,12 @@ typedef int mag_index_t;
  * bit is not set, the in-use bit is invalid.
  *
  * The szone maintains an array of NUM_TINY_SLOTS freelists, each of which is used to hold
- * free objects of the corresponding quantum size.
+ * free objects of the corresponding quantum size. In thr tiny region, the free
+ * objects for each region are arranged so that they are grouped together in their
+ * per-slot freelists and the groups are ordered roughly in the order of regions
+ * as they appear in the magazine's region list. This approach helps to reduce
+ * fragmentation. Not guaranteeing strictly the same ordering as the regions
+ * helps reduce the CPU time required to reduce fragmentation.
  *
  * A free block is laid out depending on its size, in order to fit all free
  * blocks in 16 bytes, on both 32 and 64 bit platforms.  One quantum blocks do
@@ -166,7 +169,7 @@ typedef int mag_index_t;
  * plus rounding to the nearest page.
  */
 #define CEIL_NUM_TINY_BLOCKS_WORDS (((NUM_TINY_BLOCKS + 31) & ~31) >> 5)
-#define TINY_METADATA_SIZE (sizeof(region_trailer_t) + sizeof(tiny_header_inuse_pair_t) * CEIL_NUM_TINY_BLOCKS_WORDS)
+#define TINY_METADATA_SIZE (sizeof(region_trailer_t) + sizeof(tiny_header_inuse_pair_t) * CEIL_NUM_TINY_BLOCKS_WORDS + (sizeof(region_free_blocks_t) * NUM_TINY_SLOTS))
 #define TINY_REGION_SIZE ((NUM_TINY_BLOCKS * TINY_QUANTUM + TINY_METADATA_SIZE + PAGE_MAX_SIZE - 1) & ~(PAGE_MAX_SIZE - 1))
 
 #define TINY_METADATA_START (NUM_TINY_BLOCKS * TINY_QUANTUM)
@@ -200,17 +203,27 @@ typedef int mag_index_t;
  */
 typedef uint32_t tiny_block_t[4]; // assert(TINY_QUANTUM == sizeof(tiny_block_t))
 
+#define TINY_REGION_PAD (TINY_REGION_SIZE - (NUM_TINY_BLOCKS * sizeof(tiny_block_t)) - TINY_METADATA_SIZE)
+
 typedef struct tiny_header_inuse_pair {
 	uint32_t header;
 	uint32_t inuse;
 } tiny_header_inuse_pair_t;
 
+typedef struct {
+	// Block indices are +1 so that 0 represents no free block.
+	uint16_t first_block;
+	uint16_t last_block;
+} region_free_blocks_t;
+
 typedef struct region_trailer {
+	uint32_t region_cookie;
+	volatile int32_t pinned_to_depot;
 	struct region_trailer *prev;
 	struct region_trailer *next;
 	boolean_t recirc_suitable;
-	volatile int pinned_to_depot;
 	unsigned bytes_used;
+	unsigned objects_in_use;  // Used only by tiny allocator.
 	mag_index_t mag_index;
 } region_trailer_t;
 
@@ -223,8 +236,17 @@ typedef struct tiny_region {
 	// The unused bits of each component in the last pair will be initialized to sentinel values.
 	tiny_header_inuse_pair_t pairs[CEIL_NUM_TINY_BLOCKS_WORDS];
 
-	uint8_t pad[TINY_REGION_SIZE - (NUM_TINY_BLOCKS * sizeof(tiny_block_t)) - TINY_METADATA_SIZE];
+	// Indices of the first and last free block in this region. Value is the
+	// block index + 1 so that 0 indicates no free block in this region for the
+	// corresponding slot.
+	region_free_blocks_t free_blocks_by_slot[NUM_TINY_SLOTS];
+
+	uint8_t pad[TINY_REGION_PAD];
 } * tiny_region_t;
+
+// The layout described above should result in a tiny_region_t being 1MB.
+MALLOC_STATIC_ASSERT(TINY_REGION_SIZE == (1024 * 1024), "incorrect TINY_REGION_SIZE");
+MALLOC_STATIC_ASSERT(sizeof(struct tiny_region) == TINY_REGION_SIZE, "incorrect tiny_region_size");
 
 /*
  * Per-region meta data for tiny allocator
@@ -232,6 +254,7 @@ typedef struct tiny_region {
 #define REGION_TRAILER_FOR_TINY_REGION(r) (&(((tiny_region_t)(r))->trailer))
 #define MAGAZINE_INDEX_FOR_TINY_REGION(r) (REGION_TRAILER_FOR_TINY_REGION(r)->mag_index)
 #define BYTES_USED_FOR_TINY_REGION(r) (REGION_TRAILER_FOR_TINY_REGION(r)->bytes_used)
+#define OBJECTS_IN_USE_FOR_TINY_REGION(r) (REGION_TRAILER_FOR_TINY_REGION(r)->objects_in_use)
 
 /*
  * Locate the block header for a pointer known to be within a tiny region.
@@ -247,6 +270,11 @@ typedef struct tiny_region {
  * Compute the bitmap index for a pointer known to be within a tiny region.
  */
 #define TINY_INDEX_FOR_PTR(_p) (((uintptr_t)(_p) >> SHIFT_TINY_QUANTUM) & (NUM_TINY_CEIL_BLOCKS - 1))
+
+/*
+ * Get the pointer for a given index in a region.
+ */
+#define TINY_PTR_FOR_INDEX(index, region) (region_t)((void *)(((uintptr_t)(region)) + ((index) << SHIFT_TINY_QUANTUM)))
 
 /*
  * Offset back to an szone_t given prior knowledge that this rack_t
@@ -321,7 +349,7 @@ typedef struct tiny_region {
 #define FOLLOWING_SMALL_PTR(ptr, msize) (((unsigned char *)(ptr)) + ((msize) << SHIFT_SMALL_QUANTUM))
 
 /*
- * SMALL_IS_OOB is used mark to the MSB of OOB free list entries to show that they are in use, and
+ * SMALL_IS_OOB is used to mark the MSB of OOB free list entries to show that they are in use, and
  * distinguish them from their initial, empty, state.
  */
 #define SMALL_IS_OOB (1 << 15)
@@ -402,7 +430,8 @@ typedef struct small_region {
 } * small_region_t;
 
 // The layout described above should result in a small_region_t being 8MB.
-MALLOC_STATIC_ASSERT(sizeof(struct small_region) == 8388608, "incorrect small_region_size");
+MALLOC_STATIC_ASSERT(SMALL_REGION_SIZE == (8 * 1024 * 1024), "incorrect SMALL_REGION_SIZE");
+MALLOC_STATIC_ASSERT(sizeof(struct small_region) == SMALL_REGION_SIZE, "incorrect small_region_size");
 
 /*
  * Per-region meta data for small allocator
@@ -507,7 +536,7 @@ MALLOC_STATIC_ASSERT(NUM_MEDIUM_BLOCKS <= (uint16_t)(~MEDIUM_IS_FREE),
  */
 #define MEDIUM_IS_OOB (1 << 15)
 
-#define MEDIUM_ENTROPY_BITS 13
+#define MEDIUM_ENTROPY_BITS 11
 #define MEDIUM_ENTROPY_MASK ((1 << MEDIUM_ENTROPY_BITS) - 1)
 
 /*
@@ -591,7 +620,7 @@ typedef struct medium_region {
 } * medium_region_t;
 
 // The layout described above should result in a medium_region_t being 512MB.
-MALLOC_STATIC_ASSERT(sizeof(struct medium_region) == 512 * 1024 * 1024,
+MALLOC_STATIC_ASSERT(sizeof(struct medium_region) == 128 * 1024 * 1024,
 		"incorrect medium_region_size");
 
 /*
@@ -753,7 +782,9 @@ typedef struct szone_s {	  // vm_allocate()'d, so page-aligned to begin with.
 #if CONFIG_LARGE_CACHE
 	int large_entry_cache_oldest;
 	int large_entry_cache_newest;
-	large_entry_t large_entry_cache[LARGE_ENTRY_CACHE_SIZE]; // "death row" for large malloc/free
+	large_entry_t large_entry_cache[LARGE_ENTRY_CACHE_SIZE_HIGH]; // "death row" for large malloc/free
+	int large_cache_depth;
+	size_t large_cache_entry_limit;
 	boolean_t large_legacy_reset_mprotect;
 	size_t large_entry_cache_reserve_bytes;
 	size_t large_entry_cache_reserve_limit;

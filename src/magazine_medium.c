@@ -159,6 +159,33 @@ medium_inplace_unchecksum_ptr(rack_t *rack, inplace_linkage_s *linkage)
 }
 
 static MALLOC_INLINE free_list_t
+medium_inplace_unchecksum_ptr_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack, inplace_linkage_s *linkage)
+{
+	inplace_linkage_s *mapped_linkage;
+	rack_t *mapped_rack;
+	if (reader(task, (vm_address_t)linkage, sizeof(*linkage),
+			(void **)&mapped_linkage)) {
+		printer("Unable to map medium linkage pointer %p\n", linkage);
+		return (free_list_t){ .p = NULL };
+	}
+
+	if (reader(task, (vm_address_t)rack,
+			sizeof(struct rack_s), (void **)&mapped_rack)) {
+		printer("Failed to map medium rack\n");
+		return (free_list_t){ .p = NULL };
+	}
+
+	if (mapped_linkage->checksum != (uint8_t)free_list_gen_checksum(
+			(uintptr_t)mapped_linkage->ptr ^ mapped_rack->cookie ^ (uintptr_t)rack)) {
+		free_list_checksum_botch(rack, linkage, mapped_linkage->ptr);
+		__builtin_trap();
+	}
+
+	return (free_list_t){ .p = mapped_linkage->ptr };
+}
+
+static MALLOC_INLINE free_list_t
 medium_inplace_free_entry_get_previous(rack_t *rack, medium_inplace_free_entry_t ptr)
 {
 	return medium_inplace_unchecksum_ptr(rack, &ptr->previous);
@@ -174,6 +201,15 @@ static MALLOC_INLINE free_list_t
 medium_inplace_free_entry_get_next(rack_t *rack, medium_inplace_free_entry_t ptr)
 {
 	return medium_inplace_unchecksum_ptr(rack, &ptr->next);
+}
+
+static MALLOC_INLINE free_list_t
+medium_inplace_free_entry_get_next_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack,
+		medium_inplace_free_entry_t ptr)
+{
+	return medium_inplace_unchecksum_ptr_task(task, reader, printer, rack,
+			&ptr->next);
 }
 
 static MALLOC_INLINE void
@@ -229,11 +265,47 @@ medium_oob_free_entry_get_next(oob_free_entry_t oobe)
 	return (free_list_t){ .p = (void *)oobe->next };
 }
 
+static MALLOC_INLINE free_list_t
+medium_oob_free_entry_get_next_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, oob_free_entry_t oobe)
+{
+	oob_free_entry_t mapped_oobe;
+	if (reader(task, (vm_address_t)oobe, sizeof(*oobe),
+			(void **)&mapped_oobe)) {
+		printer("Failed to map medium oobe pointer\n");
+		return (free_list_t){ .p = NULL };
+	}
+	return (free_list_t){ .p = (void *)mapped_oobe->next };
+}
+
 static MALLOC_INLINE void *
 medium_oob_free_entry_get_ptr(oob_free_entry_t oobe)
 {
 	medium_region_t region = MEDIUM_REGION_FOR_PTR(oobe);
 	uint16_t block = oobe->ptr & ~MEDIUM_IS_OOB;
+	return (void *)((uintptr_t)region + (block << SHIFT_MEDIUM_QUANTUM));
+}
+
+static MALLOC_INLINE void *
+medium_oob_free_entry_get_ptr_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, oob_free_entry_t oobe)
+{
+	// We need to map the oob_free_entry_t to read the pointer value.
+	oob_free_entry_t mapped_oobe;
+	if (reader(task, (vm_address_t)oobe, sizeof(*oobe),
+			(void **)&mapped_oobe)) {
+		printer("Failed to map medium oobe pointer\n");
+		return NULL;
+	}
+
+	if (!(mapped_oobe->ptr & MEDIUM_IS_OOB)) {
+		return NULL;
+	}
+
+	// The rest of this code works with target process addresses and returns an
+	// address in the target process.
+	medium_region_t region = MEDIUM_REGION_FOR_PTR(oobe);
+	uint16_t block = mapped_oobe->ptr & ~MEDIUM_IS_OOB;
 	return (void *)((uintptr_t)region + (block << SHIFT_MEDIUM_QUANTUM));
 }
 
@@ -336,6 +408,19 @@ medium_free_list_get_next(rack_t *rack, free_list_t ptr)
 	}
 }
 
+static MALLOC_INLINE free_list_t
+medium_free_list_get_next_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack, free_list_t ptr)
+{
+	MALLOC_ASSERT(ptr.p);
+	if (medium_is_oob_free_entry(ptr)) {
+		return medium_oob_free_entry_get_next_task(task, reader, printer, ptr.oob);
+	} else {
+		return medium_inplace_free_entry_get_next_task(task, reader, printer,
+				rack, ptr.medium_inplace);
+	}
+}
+
 static MALLOC_INLINE void *
 medium_free_list_get_ptr(rack_t *rack, free_list_t ptr)
 {
@@ -343,6 +428,19 @@ medium_free_list_get_ptr(rack_t *rack, free_list_t ptr)
 		return NULL;
 	} else if (medium_is_oob_free_entry(ptr)) {
 		return medium_oob_free_entry_get_ptr(ptr.oob);
+	} else {
+		return (void *)ptr.p;
+	}
+}
+
+static MALLOC_INLINE void *
+medium_free_list_get_ptr_task(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, free_list_t ptr)
+{
+	if (!ptr.p) {
+		return NULL;
+	} else if (medium_is_oob_free_entry(ptr)) {
+		return medium_oob_free_entry_get_ptr_task(task, reader, printer, ptr.oob);
 	} else {
 		return (void *)ptr.p;
 	}
@@ -419,12 +517,13 @@ medium_free_mark_unfree(rack_t *rack, free_list_t entry, msize_t msize)
 }
 
 static MALLOC_INLINE unsigned int
-medium_free_list_count(rack_t *rack, free_list_t ptr)
+medium_free_list_count(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack, free_list_t ptr)
 {
 	unsigned int count = 0;
 	while (ptr.p) {
 		count++;
-		ptr = medium_free_list_get_next(rack, ptr);
+		ptr = medium_free_list_get_next_task(task, reader, printer, rack, ptr);
 	}
 	return count;
 }
@@ -740,7 +839,6 @@ medium_free_scan_madvise_free(rack_t *rack, magazine_t *depot_ptr, region_t r)
 	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(r);
 	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(start);
 	msize_t *madv_headers = MEDIUM_MADVISE_HEADER_FOR_PTR(start);
-	int cnt = 0;
 
 	medium_advisory_t advisories = NULL;
 
@@ -807,7 +905,7 @@ medium_free_scan_madvise_free(rack_t *rack, magazine_t *depot_ptr, region_t r)
 		current += MEDIUM_BYTES_FOR_MSIZE(alloc_msize);
 	}
 
-	if (cnt > 0) {
+	if (advisories) {
 		OSAtomicIncrement32Barrier(
 				&(REGION_TRAILER_FOR_MEDIUM_REGION(r)->pinned_to_depot));
 		SZONE_MAGAZINE_PTR_UNLOCK(depot_ptr);
@@ -2015,9 +2113,6 @@ medium_in_use_enumerator(task_t task,
 				recorder(task, context, MALLOC_PTR_REGION_RANGE_TYPE, &ptr_range, 1);
 			}
 			if (type_mask & MALLOC_PTR_IN_USE_RANGE_TYPE) {
-				vm_address_t mag_last_free = 0;
-				msize_t mag_last_free_msize = 0;
-
 				err = reader(task, range.address, range.size, (void **)&mapped_region);
 				if (err) {
 					return err;
@@ -2026,17 +2121,16 @@ medium_in_use_enumerator(task_t task,
 				mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(mapped_region);
 				magazine_t *medium_mag_ptr = medium_mag_base + mag_index;
 
-				if (DEPOT_MAGAZINE_INDEX != mag_index) {
-					mag_last_free = (uintptr_t)medium_mag_ptr->mag_last_free;
-					mag_last_free_msize = medium_mag_ptr->mag_last_free_msize;
-				} else {
-					for (mag_index = 0; mag_index < szone->medium_rack.num_magazines; mag_index++) {
-						if ((void *)range.address == (medium_mag_base + mag_index)->mag_last_free_rgn) {
-							mag_last_free = (uintptr_t)(medium_mag_base + mag_index)->mag_last_free;
-							mag_last_free_msize = (medium_mag_base + mag_index)->mag_last_free_msize;
-						}
+				int cached_free_blocks = 0;
+#if CONFIG_MEDIUM_CACHE
+				// Each magazine could have a pointer to a cached free block from
+				// this region. Count the regions that have such a pointer.
+				for (mag_index = 0; mag_index < szone->medium_rack.num_magazines; mag_index++) {
+					if ((void *)range.address == (medium_mag_base + mag_index)->mag_last_free_rgn) {
+						cached_free_blocks++;
 					}
 				}
+#endif // CONFIG_MEDIUM_CACHE
 
 				block_header = (msize_t *)(mapped_region + MEDIUM_METADATA_START + sizeof(region_trailer_t));
 				block_index = 0;
@@ -2045,13 +2139,34 @@ medium_in_use_enumerator(task_t task,
 					block_index += MEDIUM_MSIZE_FOR_BYTES(medium_mag_ptr->mag_bytes_free_at_start);
 					block_limit -= MEDIUM_MSIZE_FOR_BYTES(medium_mag_ptr->mag_bytes_free_at_end);
 				}
-				while (block_index < block_limit) {
+				for (;block_index < block_limit; block_index += msize) {
 					msize_and_free = block_header[block_index];
 					msize = msize_and_free & ~MEDIUM_IS_FREE;
-					if (!(msize_and_free & MEDIUM_IS_FREE) &&
-						range.address + MEDIUM_BYTES_FOR_MSIZE(block_index) != mag_last_free) {
+					if (!msize) {
+						return KERN_FAILURE; // Somethings amiss. Avoid looping at this block_index.
+					}
+					if (!(msize_and_free & MEDIUM_IS_FREE)) {
+						vm_address_t ptr = range.address + MEDIUM_BYTES_FOR_MSIZE(block_index);
+#if CONFIG_MEDIUM_CACHE
+						// If there are still magazines that have cached free
+						// blocks in this region, check whether this is one of
+						// them and don't return the block pointer if it is.
+						boolean_t block_cached = false;
+						if (cached_free_blocks) {
+							for (mag_index = 0; mag_index < szone->medium_rack.num_magazines; mag_index++) {
+								if ((void *)ptr == (medium_mag_base + mag_index)->mag_last_free) {
+									block_cached = true;
+									cached_free_blocks--;
+									break;
+								}
+							}
+						}
+						if (block_cached) {
+							continue;
+						}
+#endif // CONFIG_MEDIUM_CACHE
 						// Block in use
-						buffer[count].address = range.address + MEDIUM_BYTES_FOR_MSIZE(block_index);
+						buffer[count].address = ptr;
 						buffer[count].size = MEDIUM_BYTES_FOR_MSIZE(msize);
 						count++;
 						if (count >= MAX_RECORDER_BUFFER) {
@@ -2059,11 +2174,6 @@ medium_in_use_enumerator(task_t task,
 							count = 0;
 						}
 					}
-
-					if (!msize) {
-						return KERN_FAILURE; // Somethings amiss. Avoid looping at this block_index.
-					}
-					block_index += msize;
 				}
 				if (count) {
 					recorder(task, context, MALLOC_PTR_IN_USE_RANGE_TYPE, buffer, count);
@@ -2469,40 +2579,66 @@ free_medium(rack_t *rack, void *ptr, region_t medium_region, size_t known_size)
 }
 
 void
-print_medium_free_list(rack_t *rack)
+print_medium_free_list(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack)
 {
 	free_list_t ptr;
 	_SIMPLE_STRING b = _simple_salloc();
 	mag_index_t mag_index;
 
 	if (b) {
+		rack_t *mapped_rack;
+		magazine_t *mapped_magazines;
+		if (reader(task, (vm_address_t)rack, sizeof(struct rack_s),
+				(void **)&mapped_rack)) {
+			printer("Failed to map medium rack\n");
+			return;
+		}
+		if (reader(task, (vm_address_t)mapped_rack->magazines,
+				mapped_rack->num_magazines * sizeof(magazine_t),
+				(void **)&mapped_magazines)) {
+			printer("Failed to map medium rack magazines\n");
+			return;
+		}
+
 		_simple_sappend(b, "medium free sizes:\n");
-		for (mag_index = -1; mag_index < rack->num_magazines; mag_index++) {
+		grain_t free_slots = MEDIUM_FREE_SLOT_COUNT(mapped_rack);
+		for (mag_index = -1; mag_index < mapped_rack->num_magazines;
+				mag_index++) {
 			grain_t slot = 0;
-			_simple_sprintf(b, "\tMagazine %d: ", mag_index);
-			while (slot < MEDIUM_FREE_SLOT_COUNT(rack)) {
-				ptr = rack->magazines[mag_index].mag_free_list[slot];
-				if (medium_free_list_get_ptr(rack, ptr)) {
-					_simple_sprintf(b, "%s%y[%llu]; ", (slot == MEDIUM_FREE_SLOT_COUNT(rack) - 1) ? ">=" : "", (slot + 1) * MEDIUM_QUANTUM,
-									medium_free_list_count(rack, ptr));
+			if (mag_index == -1) {
+				_simple_sprintf(b, "\tRecirc depot: ");
+			} else {
+				_simple_sprintf(b, "\tMagazine %d: ", mag_index);
+			}
+			while (slot < free_slots) {
+				ptr = mapped_magazines[mag_index].mag_free_list[slot];
+				if (medium_free_list_get_ptr_task(task, reader, printer, ptr)) {
+					_simple_sprintf(b, "%s%y[%lld]; ", (slot == free_slots - 1) ?
+							">=" : "", (slot + 1) * MEDIUM_QUANTUM,
+							medium_free_list_count(task, reader, printer,
+									rack, ptr));
 				}
 				slot++;
 			}
 			_simple_sappend(b, "\n");
 		}
-		malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%s\n", _simple_string(b));
+		printer("%s\n", _simple_string(b));
 		_simple_sfree(b);
 	}
 }
 
 void
-print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t bytes_at_start, size_t bytes_at_end)
+print_medium_region(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, szone_t *szone, int level,
+		region_t region, size_t bytes_at_start, size_t bytes_at_end)
 {
 	unsigned counts[1024];
 	unsigned in_use = 0;
 	uintptr_t start = (uintptr_t)MEDIUM_REGION_ADDRESS(region);
 	uintptr_t current = start + bytes_at_start;
 	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(region) - bytes_at_end;
+	uintptr_t mapped_start;
 	msize_t msize_and_free;
 	msize_t msize;
 	unsigned ci;
@@ -2510,10 +2646,18 @@ print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t b
 	uintptr_t pgTot = 0;
 	uintptr_t advTot = 0;
 
+	if (reader(task, (vm_address_t)start, MEDIUM_REGION_SIZE,
+			(void **)&mapped_start)) {
+		printer("Failed to map small region at %p\n", start);
+		return;
+	}
+	off_t start_offset = mapped_start - start;
+	region_t mapped_region = (region_t)mapped_start;
+
 	if (region == HASHRING_REGION_DEALLOCATED) {
 		if ((b = _simple_salloc()) != NULL) {
 			_simple_sprintf(b, "Medium region [unknown address] was returned to the OS\n");
-			malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%s\n", _simple_string(b));
+			printer("%s\n", _simple_string(b));
 			_simple_sfree(b);
 		}
 		return;
@@ -2521,10 +2665,12 @@ print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t b
 
 	memset(counts, 0, sizeof(counts));
 	while (current < limit) {
-		msize_and_free = *MEDIUM_METADATA_FOR_PTR(current);
+		msize_and_free = *(uintptr_t *)((char *)MEDIUM_METADATA_FOR_PTR(current)
+				+ start_offset);
 		msize = msize_and_free & ~MEDIUM_IS_FREE;
 		if (!msize) {
-			malloc_report(ASL_LEVEL_ERR, "*** error with %p: msize=%d\n", (void *)current, (unsigned)msize);
+			printer("*** error with %p: msize=%d, free: %x\n", (void *)current,
+					(unsigned)msize, msize_and_free & MEDIUM_IS_FREE);
 			break;
 		}
 		if (!(msize_and_free & MEDIUM_IS_FREE)) {
@@ -2534,8 +2680,10 @@ print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t b
 			}
 			in_use++;
 		} else {
-			uintptr_t pgLo = round_page_quanta(current + sizeof(medium_inplace_free_entry_s) + sizeof(msize_t));
-			uintptr_t pgHi = trunc_page_quanta(current + MEDIUM_BYTES_FOR_MSIZE(msize) - sizeof(msize_t));
+			uintptr_t pgLo = round_page_quanta(current + 
+					sizeof(medium_inplace_free_entry_s) + sizeof(msize_t));
+			uintptr_t pgHi = trunc_page_quanta(current + 
+					MEDIUM_BYTES_FOR_MSIZE(msize) - sizeof(msize_t));
 
 			if (pgLo < pgHi) {
 				pgTot += (pgHi - pgLo);
@@ -2556,25 +2704,39 @@ print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t b
 		current += MEDIUM_BYTES_FOR_MSIZE(msize);
 	}
 	if ((b = _simple_salloc()) != NULL) {
-		_simple_sprintf(b, "Medium region [%p-%p, %y] \t", (void *)start, MEDIUM_REGION_END(region), (int)MEDIUM_REGION_SIZE);
-		_simple_sprintf(b, "Magazine=%d \t", MAGAZINE_INDEX_FOR_MEDIUM_REGION(region));
-		_simple_sprintf(b, "Allocations in use=%d \t Bytes in use=%ly \t", in_use, BYTES_USED_FOR_MEDIUM_REGION(region));
+		mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(mapped_region);
+		_simple_sprintf(b, "Medium region [%p-%p, %y] \t", (void *)start,
+				MEDIUM_REGION_END(region), (int)MEDIUM_REGION_SIZE);
+		if (mag_index == DEPOT_MAGAZINE_INDEX) {
+			_simple_sprintf(b, "Recirc depot \t");
+		} else {
+			_simple_sprintf(b, "Magazine=%d \t", mag_index);
+		}
+		_simple_sprintf(b, "Allocations in use=%d \t Bytes in use=%ly (%d%%) \t",
+				in_use, BYTES_USED_FOR_MEDIUM_REGION(region),
+				(int)(100.0F * BYTES_USED_FOR_MEDIUM_REGION(mapped_region))/MEDIUM_REGION_SIZE);
 		if (bytes_at_end || bytes_at_start) {
 			_simple_sprintf(b, "Untouched=%ly ", bytes_at_end + bytes_at_start);
 		}
 		_simple_sprintf(b, "Advised=%ly ", advTot);
+#if CONFIG_RECIRC_DEPOT
+		_simple_sprintf(b, medium_region_below_recirc_threshold(mapped_region) ?
+				"\tEmpty enough to be moved to recirc depot" :
+				"\tNot empty enough to be moved to recirc depot");
+#endif // CONFIG_RECIRC_DEPOT
 		_simple_sprintf(b, "Dirty=%ly ", MEDIUM_REGION_PAYLOAD_BYTES - 
 				bytes_at_start - bytes_at_end -
-				BYTES_USED_FOR_MEDIUM_REGION(region) - advTot);
-		if (verbose && in_use) {
+				BYTES_USED_FOR_MEDIUM_REGION(mapped_region) - advTot);
+		if (level >= MALLOC_VERBOSE_PRINT_LEVEL && in_use) {
 			_simple_sappend(b, "\n\tSizes in use: ");
 			for (ci = 0; ci < 1024; ci++) {
 				if (counts[ci]) {
-					_simple_sprintf(b, "%d[%d] ", MEDIUM_BYTES_FOR_MSIZE(ci), counts[ci]);
+					_simple_sprintf(b, "%y[%d] ", MEDIUM_BYTES_FOR_MSIZE(ci),
+							counts[ci]);
 				}
 			}
 		}
-		malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX, "%s\n", _simple_string(b));
+		printer("%s\n", _simple_string(b));
 		_simple_sfree(b);
 	}
 }

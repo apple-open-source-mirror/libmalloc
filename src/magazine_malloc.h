@@ -34,6 +34,8 @@ MALLOC_NOEXPORT
 szone_t *
 create_scalable_szone(size_t initial_size, unsigned debug_flags);
 
+// Allegedly exported for performance/debugging tools
+
 MALLOC_EXPORT
 boolean_t
 scalable_zone_statistics(malloc_zone_t *zone, malloc_statistics_t *stats, unsigned subzone);
@@ -52,6 +54,9 @@ extern bool magazine_medium_enabled;
 
 MALLOC_NOEXPORT
 extern uint64_t magazine_medium_active_threshold;
+
+MALLOC_NOEXPORT
+extern uint64_t magazine_large_expanded_cache_threshold;
 
 // MARK: magazine_malloc utility functions
 
@@ -136,7 +141,7 @@ tiny_free_list_check(rack_t *rack, grain_t slot, unsigned counter);
 
 MALLOC_NOEXPORT
 boolean_t
-tiny_free_no_lock(rack_t *rack, magazine_t *tiny_mag_ptr, mag_index_t mag_index, region_t region, void *ptr, msize_t msize);
+tiny_free_no_lock(rack_t *rack, magazine_t *tiny_mag_ptr, mag_index_t mag_index, region_t region, void *ptr, msize_t msize, boolean_t partial_free);
 
 MALLOC_NOEXPORT
 size_t
@@ -177,7 +182,8 @@ tiny_try_realloc_in_place(rack_t *rack, void *ptr, size_t old_size, size_t new_s
 
 MALLOC_NOEXPORT
 void
-free_tiny(rack_t *rack, void *ptr, region_t tiny_region, size_t known_size);
+free_tiny(rack_t *rack, void *ptr, region_t tiny_region, size_t known_size,
+		boolean_t partial_free);
 
 MALLOC_NOEXPORT
 size_t
@@ -193,11 +199,14 @@ tiny_batch_free(szone_t *szone, void **to_be_freed, unsigned count);
 
 MALLOC_NOEXPORT
 void
-print_tiny_free_list(rack_t *rack);
+print_tiny_free_list(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack);
 
 MALLOC_NOEXPORT
 void
-print_tiny_region(boolean_t verbose, region_t region, size_t bytes_at_start, size_t bytes_at_end);
+print_tiny_region(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, int level, region_t region,
+		size_t bytes_at_start, size_t bytes_at_end);
 
 #if CONFIG_MADVISE_PRESSURE_RELIEF
 MALLOC_NOEXPORT
@@ -267,11 +276,14 @@ small_size(rack_t *rack, const void *ptr);
 
 MALLOC_NOEXPORT
 void
-print_small_free_list(rack_t *rack);
+print_small_free_list(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack);
 
 MALLOC_NOEXPORT
 void
-print_small_region(szone_t *szone, boolean_t verbose, region_t region, size_t bytes_at_start, size_t bytes_at_end);
+print_small_region(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, szone_t *szone, int level,
+		region_t region, size_t bytes_at_start, size_t bytes_at_end);
 
 #if CONFIG_MADVISE_PRESSURE_RELIEF
 MALLOC_NOEXPORT
@@ -341,11 +353,14 @@ medium_size(rack_t *rack, const void *ptr);
 
 MALLOC_NOEXPORT
 void
-print_medium_free_list(rack_t *rack);
+print_medium_free_list(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, rack_t *rack);
 
 MALLOC_NOEXPORT
 void
-print_medium_region(szone_t *szone, boolean_t verbose, region_t region, size_t bytes_at_start, size_t bytes_at_end);
+print_medium_region(task_t task, memory_reader_t reader,
+		print_task_printer_t printer, szone_t *szone, int level,
+		region_t region, size_t bytes_at_start, size_t bytes_at_end);
 
 MALLOC_NOEXPORT
 void
@@ -393,24 +408,12 @@ boolean_t
 large_claimed_address(szone_t *szone, void *ptr);
 
 MALLOC_NOEXPORT
+void
+large_debug_print(task_t task, unsigned level, vm_address_t zone_address,
+		memory_reader_t reader, print_task_printer_t printer);
+
+MALLOC_NOEXPORT
 void *
 szone_malloc_should_clear(szone_t *szone, size_t size, boolean_t cleared_requested);
-
-// MARK: stack logging lite functionality
-
-#define MALLOC_STOCK_LOGGING_LITE_ZONE_NAME "MallocStackLoggingLiteZone"
-
-// These enable/disable stack logging lite for malloc allocations, not VM-only lite mode
-MALLOC_NOEXPORT
-void
-enable_stack_logging_lite();
-
-MALLOC_NOEXPORT
-void
-disable_stack_logging_lite();
-
-MALLOC_NOEXPORT
-malloc_zone_t *
-create_stack_logging_lite_zone(size_t initial_size, malloc_zone_t *helper_zone, unsigned debug_flags);
 
 #endif // __MAGAZINE_MALLOC_H

@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <sys/queue.h>
 
+#if TARGET_OS_WATCH
+#define TEST_TIMEOUT 1200
+#endif // TARGET_OS_WATCH
+
 TAILQ_HEAD(thead, entry);
 struct entry {
 	TAILQ_ENTRY(entry) next;
@@ -32,6 +36,9 @@ stress(size_t sz, size_t cnt)
 }
 
 T_DECL(tiny_mem_pressure_multi, "test memory pressure in tiny on threads",
+#if TARGET_OS_WATCH
+		T_META_TIMEOUT(TEST_TIMEOUT),
+#endif // TARGET_OS_WATCH
 		T_META_CHECK_LEAKS(false)) {
 	dispatch_group_t g = dispatch_group_create();
 	for (int i=0; i<16; i++) {
@@ -53,6 +60,9 @@ T_DECL(tiny_mem_pressure_multi, "test memory pressure in tiny on threads",
 }
 
 T_DECL(small_mem_pressure_multi, "test memory pressure in small on threads",
+#if TARGET_OS_WATCH
+		T_META_TIMEOUT(TEST_TIMEOUT),
+#endif // TARGET_OS_WATCH
 		T_META_CHECK_LEAKS(false)) {
 	dispatch_group_t g = dispatch_group_create();
 	for (int i=0; i<3; i++) {
@@ -74,6 +84,9 @@ T_DECL(small_mem_pressure_multi, "test memory pressure in small on threads",
 }
 
 T_DECL(medium_mem_pressure_multi, "test memory pressure in medium on threads",
+#if TARGET_OS_WATCH
+		T_META_TIMEOUT(TEST_TIMEOUT),
+#endif // TARGET_OS_WATCH
 		T_META_CHECK_LEAKS(false)) {
 	dispatch_group_t g = dispatch_group_create();
 	for (int i=0; i<30; i++) {
